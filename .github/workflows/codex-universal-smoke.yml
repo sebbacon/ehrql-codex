@@ -1,0 +1,17 @@
+name: Codex Universal smoke test
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run Codex Universal smoke test
+        run: bash scripts/smoke-codex-universal.sh
