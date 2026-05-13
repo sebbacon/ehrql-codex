@@ -25,6 +25,59 @@ Use this skill when the user wants this repo's dataset definition changed to mat
 - When you add tests, organize scenarios so they are easy to scan:
   `in population`, `excluded`, `boundary date`, `no matching event`, `multiple matching events`, and similar slices.
 
+## Codelists
+
+Always use SNOMED CT codelists unless the study spec explicitly requires a different coding system.
+
+### Finding codelists
+
+Search for codelists at opencodelists.org using a web search restricted to that site. Example query pattern:
+
+```
+site:opencodelists.org <condition or concept> SNOMED
+```
+
+Add keywords to narrow results — include synonyms, clinical context, or the specific concept hierarchy (e.g. "type 2 diabetes mellitus" rather than just "diabetes"; "asthma diagnosis" rather than "asthma").
+
+When several candidate codelists appear, select using this priority order:
+
+1. **Organisation** — prefer official organisations: NHS, NHSE, PHE, UKHSA, OpenSAFELY, PRIMIS, or named academic groups over personal or unnamed publishers.
+2. **Recency and completeness** — prefer a more recent version or update date; prefer a codelist that looks more complete (larger, covers the full concept hierarchy) over a partial or stub list.
+3. **Name match** — prefer a codelist whose name closely matches the concept being coded.
+
+If you cannot find a SNOMED CT codelist on opencodelists.org, note that explicitly in a comment and suggest the user search manually.
+
+### Codelist import comments
+
+When importing a codelist in the dataset definition, add an inline comment on the same line or the line above that states:
+
+- **Confidence level**: `HIGH`, `MEDIUM`, or `LOW`
+  - `HIGH`: strong name match, official org, recent, looks complete
+  - `MEDIUM`: reasonable match but some uncertainty about coverage, recency, or org
+  - `LOW`: best available but notable concerns (old, partial, unofficial, or ambiguous name)
+- **Other candidates**: if you found other plausible codelists, name them briefly so a reviewer can check
+
+Example:
+
+```python
+# CONFIDENCE: HIGH — NHS/OpenSAFELY list, recent, full concept hierarchy
+# Other candidates: codelist/user/asthma-snomed-v1 (older, partial)
+asthma_codes = codelist_from_csv("codelists/nhsd-primary-care-domain-refsets-ast_cod.csv", column="code")
+```
+
+### WARNING comment
+
+Whenever codelists are imported, add a clearly visible block comment near the top of the imports section:
+
+```python
+# ============================================================
+# WARNING: All codelists below must be carefully reviewed.
+# The wrong codelist may have been selected, or a codelist
+# may be out of date. Do not use this definition in
+# production without expert clinical review of every codelist.
+# ============================================================
+```
+
 ## Runbook
 
 - Setup: `bash .codex/setup.sh`
