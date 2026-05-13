@@ -77,8 +77,34 @@ Always test. Dummy-data generation checks that the definition compiles and can p
 - In assurance tests, make the patient stories obvious. A small number of well-named scenarios is better than a dense unreadable fixture.
 - Every test case should include comments that explicitly describe the rule being checked, such as why the patient is included, why they are excluded, or which boundary/window behaviour is under test.
 - When dataset logic follows a written specification, annotate the corresponding code blocks with comments that point back to the specification text rather than leaving the mapping implicit.
+- After finishing the ehrQL definition and assurance tests, proactively offer to write a custom dummy-table generator when that would help exercise edge cases, clarify expected outputs, or make the spec easier to validate visually.
 
-## References
+## Custom dummy-table generator
+
+When writing a `scripts/generate_dummy_tables.py` (or equivalent), produce data that looks like realistic underlying clinical data, not just the minimum needed to satisfy ehrQL's column constraints.
+
+### Planning step (do this before writing code)
+
+Before generating any events, reason about the domain being modelled:
+
+1. **Population size and prevalence** — pick a realistic N (e.g. 5 000 patients) and realistic condition prevalence by demographic group. Use published rates where known (e.g. QOF register rates, ONS age distributions). Document the rates as named constants.
+2. **Proportions and ratios** — if the ehrQL computes numerators and denominators (indicators, coverage rates, achievement percentages), plan what realistic achievement rates look like and work backwards to the fractions of patients in each outcome bucket. Name every fraction as a constant.
+3. **Time span** — identify every date column the ehrQL reads. If the underlying real-world phenomenon (diagnoses, annual reviews, prescriptions, referrals) recurs over years, generate events across the full plausible history, not just the measurement window. Use the measurement-window dates only to govern current-period outcomes.
+4. **Event patterns** — for recurring events (annual reviews, repeat prescriptions, follow-up appointments), generate one event per recurrence period across the patient's history, with a realistic non-attendance rate. Do not generate only the events the ehrQL's WHERE clauses will touch.
+
+### Implementation principles
+
+- Declare every rate, fraction, and count as a named module-level constant with a short comment explaining its real-world meaning. Never embed magic numbers in logic.
+- Assign each patient a *profile* dict before generating any events. The profile encodes their outcome bucket (e.g. `{"on_register": True, "ast007_outcome": "numerator", ...}`). Generate events deterministically from the profile so the mapping between input fractions and output rows is transparent.
+- For recurring events across prior periods, loop over each period (e.g. each QOF year) and apply the historical rate. This ensures event-count time series span the full history rather than spiking only at the measurement window.
+- Use `numpy.random.default_rng(seed)` with a fixed seed for reproducibility.
+- Print a summary table of expected vs generated counts (register size, denominator, numerator, achievement rate) so the user can sanity-check the output without opening the CSV.
+
+### What NOT to do
+
+- Do not generate dates solely in the range needed to pass ehrQL's filter predicates. If reviews happen annually, generate them annually across the patient's history.
+- Do not hardcode representative proportions as inline literals — name them.
+- Do not generate only the tables or columns the current ehrQL reads; generate all standard tables (patients, registrations, clinical_events, medications) with enough realism that the data could plausibly feed a different query on the same population.
 
 - Generated local index: `references/source-index.md`
 - Upstream copies: `references/upstream/*.md`
