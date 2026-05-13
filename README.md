@@ -10,15 +10,8 @@ For Codex Cloud, use this setup command:
 bash .codex/setup.sh
 ```
 
-The setup script installs/syncs the `uv` environment, ensures Docker is
-available, starts a nested Docker daemon when needed, pulls `ehrql:v1`, and
-checks that OpenSAFELY can execute inside Docker.
-
-For the exact `opensafely ...` command, install the CLI with `uv`:
-
-```sh
-uv tool install opensafely==1.56.8
-```
+The setup script installs/syncs the `uv` environment and checks that the
+`ehrql` CLI is available.
 
 Alternatively, install the project-local locked environment:
 
@@ -31,18 +24,18 @@ uv sync
 After setup, run:
 
 ```sh
-opensafely exec ehrql:v1 generate-dataset analysis/dataset_definition.py --output dataset.csv
+ehrql generate-dataset analysis/dataset_definition.py --output dataset.csv
+```
+
+```sh
+source .venv/bin/activate
+ehrql generate-dataset analysis/dataset_definition.py --output dataset.csv
 ```
 
 If you used `uv sync`, run through `uv` or activate the virtual environment first:
 
 ```sh
-uv run opensafely exec ehrql:v1 generate-dataset analysis/dataset_definition.py --output dataset.csv
-```
-
-```sh
-source .venv/bin/activate
-opensafely exec ehrql:v1 generate-dataset analysis/dataset_definition.py --output dataset.csv
+uv run ehrql generate-dataset analysis/dataset_definition.py --output dataset.csv
 ```
 
 ## Codex Universal Smoke Test
@@ -52,9 +45,6 @@ To test the Codex setup locally inside the reference Codex image:
 ```sh
 bash scripts/smoke-codex-universal.sh
 ```
-
-This pulls `ghcr.io/openai/codex-universal:latest` and runs it with
-`--privileged` so Docker-in-Docker can start inside the container.
 
 The same smoke test is also available as the `Codex Universal smoke test`
 GitHub Actions workflow.

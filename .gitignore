@@ -3,6 +3,8 @@
 /lib/
 /pyvenv.cfg
 /CACHEDIR.TAG
+/__pycache__/
+**/__pycache__/
 /dataset.csv
 /keepme.txt
 /.DS_Store
