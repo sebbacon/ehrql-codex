@@ -1,0 +1,23 @@
+version = 1
+revision = 3
+requires-python = ">=3.12"
+
+[[package]]
+name = "ehrql-codex"
+version = "0.1.0"
+source = { virtual = "." }
+dependencies = [
+    { name = "opensafely" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "opensafely", specifier = ">=1.56.8" }]
+
+[[package]]
+name = "opensafely"
+version = "1.56.8"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/a1/29/0286d6f0074e0ca8fde5470c986c95e5087436ccefb229be4d0d6df104b9/opensafely-1.56.8.tar.gz", hash = "sha256:234eea138905ad9b5e9a7ea629585c06b512ede5fdf82624d7b700c3bd3a64fd", size = 694140, upload-time = "2026-04-23T10:41:37.294Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/88/1b/124cabfd46e164010fbaf2dc82ad852ab79627bbdcf9365e193555326e04/opensafely-1.56.8-py3-none-any.whl", hash = "sha256:2d417a720a7a70dfaf23912d10d759cf155dc3fdc1f0f31d64aff28350699611", size = 776849, upload-time = "2026-04-23T10:41:35.585Z" },
+]

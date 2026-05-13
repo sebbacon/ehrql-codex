@@ -1,0 +1,7 @@
+/.venv/
+/bin/
+/lib/
+/pyvenv.cfg
+/CACHEDIR.TAG
+/dataset.csv
+/.DS_Store

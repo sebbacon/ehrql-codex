@@ -1,0 +1,10 @@
+[project]
+name = "ehrql-codex"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "opensafely>=1.56.8",
+]
+
+[tool.uv]
+package = false
