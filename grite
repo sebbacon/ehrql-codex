@@ -1,0 +1,876 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# grite — manage Sprite VMs as git remotes ("grites").
+#
+# Usage:
+#   grite new  [task-name]    Create a new grite and push the current repo
+#   grite join <task-name>    Add the current repo to an existing grite
+#   grite rm   <task-name>    Destroy a grite and remove all its git remotes
+#   grite ls                  List all grites and their status
+#   grite open <task-name>    Open a grite's URL in the browser
+#   grite c    <task-name>    Attach to or start a console session
+#
+# Push/pull/fetch with grites however you use git, subbing out `origin` for the grite.
+# If you ran `grite new build-a-thing`, then you can use it with:
+#   git fetch build-a-thing
+#   git push build-a-thing main
+#   git pull build-a-thing some-branch
+#
+# Inside the grite, you (or Claude, or ...) will commit and push to the local git registry.
+# For example: get Claude to commit and push its changes, then you fetch
+# from the grite and cherry pick the commits into staged changes locally.
+#
+# The git server in the grite uses the HTTP service, but it proxies everything non-git
+# through to :3000. So you can host whatever you want on port 3000, and it's accessible
+# on your sprite url. (grites disable auth by default so it'll be "public", though the git is protected).
+# Scroll down to CLAUDE_MD in this file to see more info.
+#
+# Project-specific instructions (.grite file):
+#   Place a `.grite` file in the root of any repo to include project-specific
+#   instructions in the sprite's CLAUDE.md. Useful instructions here include
+#   how to install specific dependencies in a sprite, how to run tests without
+#   OOM-ing, etc. (e.g. I tell my grites how to install Chrome the best)
+#
+#   To gitignore .grite globally, add it to ~/.config/git/ignore:
+#     echo ".grite" >> ~/.config/git/ignore
+
+MAX_RETRIES=5
+RETRY_DELAY=3
+REPO="$(basename "$(pwd)")"
+REGISTRY="${HOME}/.grite"
+
+# Ensure registry file exists
+touch "$REGISTRY"
+
+# ─── Registry helpers ──────────────────────────────────────────────────────────
+
+registry_add() {
+    local sprite_name="$1" repo_path="$2"
+    registry_remove "$sprite_name" "$repo_path"
+    printf '%s\t%s\n' "$sprite_name" "$repo_path" >> "$REGISTRY"
+}
+
+registry_remove() {
+    local sprite_name="$1" repo_path="$2"
+    local tmp
+    tmp="$(mktemp)"
+    grep -Fxv "${sprite_name}	${repo_path}" "$REGISTRY" > "$tmp" 2>/dev/null || true
+    mv "$tmp" "$REGISTRY"
+}
+
+registry_remove_sprite() {
+    local sprite_name="$1"
+    local tmp
+    tmp="$(mktemp)"
+    grep -v "^${sprite_name}	" "$REGISTRY" > "$tmp" 2>/dev/null || true
+    mv "$tmp" "$REGISTRY"
+}
+
+registry_repos_for_sprite() {
+    local sprite_name="$1"
+    grep "^${sprite_name}	" "$REGISTRY" 2>/dev/null | cut -f2
+}
+
+# ─── Platform helpers ──────────────────────────────────────────────────────────
+
+_date_to_epoch() {
+    if date -jf '%Y-%m-%dT%H:%M:%S' "2000-01-01T00:00:00" '+%s' &>/dev/null; then
+        date -jf '%Y-%m-%dT%H:%M:%S' "${1%%.*}" '+%s' 2>/dev/null
+    else
+        date -d "${1%%.*}" '+%s' 2>/dev/null
+    fi
+}
+
+_stat_mtime() {
+    if stat -f '%m' / &>/dev/null; then
+        stat -f '%m' "$@" 2>/dev/null
+    else
+        stat -c '%Y' "$@" 2>/dev/null
+    fi
+}
+
+_open_url() {
+    if command -v open &>/dev/null; then
+        open "$1"
+    elif command -v xdg-open &>/dev/null; then
+        xdg-open "$1"
+    else
+        echo "Open this URL manually: $1" >&2
+    fi
+}
+
+retry() {
+    local attempt=1
+    while true; do
+        if "$@"; then
+            return 0
+        fi
+        if [ "$attempt" -ge "$MAX_RETRIES" ]; then
+            echo "  Failed after $MAX_RETRIES attempts" >&2
+            return 1
+        fi
+        echo "  Attempt $attempt failed, retrying in ${RETRY_DELAY}s..." >&2
+        sleep "$RETRY_DELAY"
+        attempt=$((attempt + 1))
+    done
+}
+
+retry_exec() {
+    local attempt=1
+    local out_file
+    out_file="$(mktemp)"
+    while true; do
+        if "$@" >"$out_file" 2>&1; then
+            cat "$out_file"
+            rm -f "$out_file"
+            return 0
+        fi
+        cat "$out_file"
+        if grep -q "no exit frame received" "$out_file"; then
+            rm -f "$out_file"
+            return 0
+        fi
+        if [ "$attempt" -ge "$MAX_RETRIES" ]; then
+            echo "  Failed after $MAX_RETRIES attempts" >&2
+            rm -f "$out_file"
+            return 1
+        fi
+        echo "  Attempt $attempt failed, retrying in ${RETRY_DELAY}s..." >&2
+        sleep "$RETRY_DELAY"
+        attempt=$((attempt + 1))
+    done
+}
+
+# ─── Shared: push repo to sprite ──────────────────────────────────────────────
+
+_push_repo() {
+    local SPRITE_NAME="$1" SPRITE_URL="$2" GIT_TOKEN="$3"
+    local REPO_GIT="${REPO}.git"
+
+    # Fix overlay ownership in case prior API writes poisoned it
+    retry_exec sprite exec -s "$SPRITE_NAME" --http-post -- sudo chown sprite:sprite /home/sprite
+
+    retry_exec sprite exec -s "$SPRITE_NAME" --http-post -- git init --bare "/home/sprite/${REPO_GIT}"
+    retry_exec sprite exec -s "$SPRITE_NAME" --http-post -- git config --file "/home/sprite/${REPO_GIT}/config" http.receivepack true
+    retry_exec sprite exec -s "$SPRITE_NAME" --http-post -- git config --file "/home/sprite/${REPO_GIT}/config" http.uploadpack true
+
+    git remote remove "$SPRITE_NAME" 2>/dev/null || true
+    local AUTH_URL="${SPRITE_URL/#https:\/\//https://git:${GIT_TOKEN}@}"
+    git remote add "$SPRITE_NAME" "${AUTH_URL}/${REPO_GIT}"
+
+    local BRANCH PRIMARY
+    BRANCH="$(git symbolic-ref --short HEAD)"
+    PRIMARY="$(git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's|^origin/||' || true)"
+    PRIMARY="${PRIMARY:-main}"
+    retry git push "$SPRITE_NAME" "$PRIMARY"
+    if [[ "$BRANCH" != "$PRIMARY" ]]; then
+        retry git push "$SPRITE_NAME" "$BRANCH"
+    fi
+
+    # Point the bare repo's HEAD at the primary branch so git clone checks it out
+    retry_exec sprite exec -s "$SPRITE_NAME" --http-post -- \
+        git --git-dir "/home/sprite/${REPO_GIT}" symbolic-ref HEAD "refs/heads/${PRIMARY}"
+
+    echo "==> Cloning working copy inside sprite"
+    local TMPDIR_CLONE
+    TMPDIR_CLONE="$(mktemp -d)"
+
+    cat > "$TMPDIR_CLONE/clone.sh" << CLONEEOF
+set -e
+git clone "/home/sprite/${REPO_GIT}" "/home/sprite/${REPO}"
+cd "/home/sprite/${REPO}"
+git checkout -b "${SPRITE_NAME}" ${PRIMARY}
+CLONEEOF
+
+    retry sprite api -s "$SPRITE_NAME" \
+        "/fs/write?path=/home/sprite/clone.sh&mkdir=true" \
+        -- -X PUT --data-binary @"$TMPDIR_CLONE/clone.sh"
+
+    retry_exec sprite exec -s "$SPRITE_NAME" --http-post -- sudo chown sprite:sprite /home/sprite
+    retry_exec sprite exec -s "$SPRITE_NAME" --http-post -- bash /home/sprite/clone.sh
+    rm -rf "$TMPDIR_CLONE"
+}
+
+# ─── CLAUDE.md generation ──────────────────────────────────────────────────────
+
+# Write the base CLAUDE.md template — called once during `new`
+_write_base_claude_md() {
+    local SPRITE_NAME="$1"
+
+    read -r -d '' CLAUDE_MD << 'CLAUDEEOF' || true
+# Sprite Dev Environment
+
+## Git Server & App Proxy
+
+A combined git/proxy server runs as a sprite service on port 8080. It handles
+git operations for paths like `/<repo>.git/...` and reverse-proxies everything
+else to port 3000 (configurable via `APP_PORT` env var).
+
+## Serving an App
+
+Any HTTP server you run on port 3000 will be publicly accessible at the
+sprite's URL. The git server proxies all non-git requests to port 3000.
+
+**Always use a sprite service** to run your app server. Never use `&`,
+`run_in_background`, or `nohup` to start a server on port 3000 — orphaned
+processes will hold the port and block future service starts.
+
+```bash
+sprite-env services create my-app --cmd node --args "/home/sprite/my-server.js"
+sprite-env services restart my-app
+sprite-env services stop my-app
+sprite-env services delete my-app
+```
+
+Do NOT pass --http-port — only one HTTP service is allowed and the
+git-server already holds that slot. Your app just needs to listen on port
+3000; the git-server proxy handles the rest.
+
+Run `sprite-env info` to give the user their actual URL whenever telling them something is live.
+
+## Git Auth
+
+Git operations (push/pull) to this sprite require basic auth. The user's
+local git remote has credentials embedded in the URL, so it works
+transparently. The bare repos at `/home/sprite/*.git` are local and do
+not require auth — `git push origin` from any working copy works as normal.
+
+## Workflow
+
+Each repo has a bare git repo and a working copy. The working copy is checked
+out on a branch named after the sprite, branched off `main`.
+
+Work in the appropriate working copy directory. When you want to send changes back:
+
+1. Commit your changes in the working copy
+2. Push to the bare repo: `git push origin <branch-name>`
+3. The user pulls from their local machine: `git pull <sprite-name> <branch-name>`
+
+When the user pushes new changes, pull them into the working copy:
+
+```bash
+cd /home/sprite/<repo-name>
+git pull origin main
+```
+
+## Sprite Services
+
+- Manage with: `sprite-env services list|restart|stop|start|delete`
+- Logs at: `/.sprite/logs/services/git-server.log`
+
+## Checkpoints
+
+Use `sprite-env checkpoints create --comment "description"` to snapshot state.
+Checkpoint after completing meaningful work. After checkpointing, ask the
+user if they'd like you to commit and push your changes so they can pull
+them locally.
+CLAUDEEOF
+
+    local TMPDIR_GRITE
+    TMPDIR_GRITE="$(mktemp -d)"
+    printf '%s' "$CLAUDE_MD" > "$TMPDIR_GRITE/CLAUDE.md"
+    retry sprite api -s "$SPRITE_NAME" \
+        "/fs/write?path=/home/sprite/CLAUDE.md&mkdir=true" \
+        -- -X PUT --data-binary @"$TMPDIR_GRITE/CLAUDE.md"
+    rm -rf "$TMPDIR_GRITE"
+}
+
+# Append a repo section to the existing CLAUDE.md — called during `new` and `join`
+_append_repo_claude_md() {
+    local SPRITE_NAME="$1"
+    local REPO_NAME="$2"
+
+    local SECTION="
+
+## Repo: ${REPO_NAME}
+
+- Bare repo: \`/home/sprite/${REPO_NAME}.git\`
+- Working copy: \`/home/sprite/${REPO_NAME}\`"
+
+    if [[ -f .grite ]]; then
+        SECTION="${SECTION}
+
+$(cat .grite)"
+    fi
+
+    local TMPDIR_GRITE
+    TMPDIR_GRITE="$(mktemp -d)"
+    printf '%s' "$SECTION" > "$TMPDIR_GRITE/append.md"
+
+    cat > "$TMPDIR_GRITE/append.sh" << 'APPENDEOF'
+sudo chown sprite:sprite /home/sprite /home/sprite/.claude-md-append
+cat /home/sprite/.claude-md-append >> /home/sprite/CLAUDE.md
+rm /home/sprite/.claude-md-append
+APPENDEOF
+
+    retry sprite api -s "$SPRITE_NAME" \
+        "/fs/write?path=/home/sprite/.claude-md-append&mkdir=true" \
+        -- -X PUT --data-binary @"$TMPDIR_GRITE/append.md"
+    retry sprite api -s "$SPRITE_NAME" \
+        "/fs/write?path=/home/sprite/.claude-md-append.sh&mkdir=true" \
+        -- -X PUT --data-binary @"$TMPDIR_GRITE/append.sh"
+    retry_exec sprite exec -s "$SPRITE_NAME" --http-post -- bash /home/sprite/.claude-md-append.sh
+    rm -rf "$TMPDIR_GRITE"
+}
+
+# ─── grite ls ──────────────────────────────────────────────────────────────────
+
+cmd_ls() {
+    if [[ ! -s "$REGISTRY" ]]; then
+        echo "  No grites found."
+        return
+    fi
+
+    local api_json
+    api_json="$(sprite api "/v1/sprites?prefix=grite-" 2>/dev/null)" || api_json='{"sprites":[]}'
+
+    sprite_lookup() {
+        echo "$api_json" | jq -r --arg name "$1" \
+            '.sprites[] | select(.name == $name) | [.status, .url, (.last_running_at // .updated_at // "unknown")] | join("|")'
+    }
+
+    status_icon() {
+        case "$1" in
+            running) echo "🏃" ;;
+            warm)    echo "☀️" ;;
+            cold)    echo "🧊" ;;
+            *)       echo "💀" ;;
+        esac
+    }
+
+    timeago() {
+        if [[ -z "$1" || "$1" == "unknown" ]]; then
+            echo "--"
+            return
+        fi
+        local then_epoch now_epoch diff
+        then_epoch="$(_date_to_epoch "$1")" || { echo "??"; return; }
+        now_epoch="$(date '+%s')"
+        diff=$(( now_epoch - then_epoch ))
+        if   (( diff < 60 ));    then echo "now"
+        elif (( diff < 3600 ));  then echo "$(( diff / 60 ))m"
+        elif (( diff < 86400 )); then echo "$(( diff / 3600 ))h"
+        else echo "$(( diff / 86400 ))d"
+        fi
+    }
+
+    last_fetch_epoch() {
+        local repo_path="$1" sprite_name="$2"
+        local ref_dir="${repo_path}/.git/refs/remotes/${sprite_name}"
+        if [ -d "$ref_dir" ]; then
+            _stat_mtime "$ref_dir"/* 2>/dev/null | sort -rn | head -1
+        fi
+    }
+
+    timeago_epoch() {
+        if [[ -z "$1" ]]; then
+            echo "--"
+            return
+        fi
+        local now_epoch diff
+        now_epoch="$(date '+%s')"
+        diff=$(( now_epoch - $1 ))
+        if   (( diff < 60 ));    then echo "now"
+        elif (( diff < 3600 ));  then echo "$(( diff / 60 ))m"
+        elif (( diff < 86400 )); then echo "$(( diff / 3600 ))h"
+        else echo "$(( diff / 86400 ))d"
+        fi
+    }
+
+    # Collect unique repo paths in order, current repo first
+    local repo_paths=()
+    local seen_repos=""
+    local current="$(pwd)"
+
+    # Current repo first if it's in the registry
+    if grep -qF "	${current}" "$REGISTRY" 2>/dev/null; then
+        repo_paths+=("$current")
+        seen_repos="|${current}|"
+    fi
+
+    # Then the rest
+    while IFS=$'\t' read -r _ repo_path; do
+        if [[ "$seen_repos" != *"|${repo_path}|"* ]]; then
+            repo_paths+=("$repo_path")
+            seen_repos="${seen_repos}|${repo_path}|"
+        fi
+    done < "$REGISTRY"
+
+    printf "     %-7s %-7s %s\n" "active" "fetched" "name"
+    printf "     %-7s %-7s %s\n" "------" "-------" "----"
+
+    for repo_path in "${repo_paths[@]}"; do
+        local repo_name
+        repo_name="$(basename "$repo_path")"
+
+        # Mark current repo
+        if [[ "$repo_path" == "$current" ]]; then
+            echo "  ${repo_name}/ (here)"
+        else
+            echo "  ${repo_name}/"
+        fi
+
+        # Collect sprites for this repo, deduped
+        local seen_sprites=""
+        while IFS=$'\t' read -r sprite_name entry_path; do
+            [[ "$entry_path" == "$repo_path" ]] || continue
+            [[ "$seen_sprites" == *"|${sprite_name}|"* ]] && continue
+            seen_sprites="${seen_sprites}|${sprite_name}|"
+
+            local task="${sprite_name#grite-}"
+            local info status="destroyed" last_active=""
+            info="$(sprite_lookup "$sprite_name")"
+            if [[ -n "$info" ]]; then
+                IFS='|' read -r status _ last_active <<< "$info"
+            fi
+
+            local fetched
+            fetched="$(last_fetch_epoch "$repo_path" "$sprite_name")"
+
+            printf "    %s %-7s %-7s %s\n" \
+                "$(status_icon "$status")" \
+                "$(timeago "$last_active")" \
+                "$(timeago_epoch "$fetched")" \
+                "$task"
+
+            if [[ "$status" == "destroyed" ]]; then
+                echo "      ↳ stale — run: grite rm ${task}"
+            fi
+        done < "$REGISTRY"
+        echo ""
+    done
+}
+
+# ─── grite rm ──────────────────────────────────────────────────────────────────
+
+cmd_rm() {
+    if [ $# -lt 1 ]; then
+        echo "Usage: grite rm <task-name>" >&2
+        exit 1
+    fi
+
+    local SPRITE_NAME="grite-${1}"
+
+    printf "Delete sprite '%s' and remove all its git remotes? [y/N] " "$SPRITE_NAME"
+    read -r confirm < /dev/tty
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        echo "Aborted."
+        exit 0
+    fi
+
+    echo "==> Deleting sprite: $SPRITE_NAME"
+    sprite destroy "$SPRITE_NAME" --force || echo "  Sprite already gone or not found"
+
+    echo "==> Removing git remotes"
+
+    # Remove from current repo
+    if git remote get-url "$SPRITE_NAME" &>/dev/null; then
+        echo "  Removing remote from $(pwd)"
+        git remote remove "$SPRITE_NAME"
+    fi
+
+    # Remove from all registered repos
+    while IFS= read -r repo_path; do
+        [[ -d "$repo_path/.git" ]] || continue
+        [[ "$repo_path" == "$(pwd)" ]] && continue
+        if git -C "$repo_path" remote get-url "$SPRITE_NAME" &>/dev/null; then
+            echo "  Removing remote from $repo_path"
+            git -C "$repo_path" remote remove "$SPRITE_NAME"
+        fi
+    done < <(registry_repos_for_sprite "$SPRITE_NAME")
+
+    registry_remove_sprite "$SPRITE_NAME"
+
+    echo "Done!"
+}
+
+# ─── grite join ────────────────────────────────────────────────────────────────
+
+cmd_join() {
+    if [ $# -lt 1 ]; then
+        echo "Usage: grite join <task-name>" >&2
+        echo "  Run from the repo you want to add to an existing sprite." >&2
+        exit 1
+    fi
+
+    local SPRITE_NAME="grite-${1}"
+
+    # Verify sprite exists
+    local sprite_info
+    sprite_info="$(sprite api "/v1/sprites/${SPRITE_NAME}" 2>/dev/null)" || {
+        echo "Sprite '$SPRITE_NAME' not found. Create it first with: grite new $1" >&2
+        exit 1
+    }
+
+    local SPRITE_URL
+    SPRITE_URL="$(echo "$sprite_info" | jq -r '.url // empty')"
+    if [[ -z "$SPRITE_URL" ]]; then
+        echo "Could not get URL for sprite '$SPRITE_NAME'." >&2
+        exit 1
+    fi
+
+    echo "==> Reading auth token from sprite"
+    local GIT_TOKEN
+    GIT_TOKEN="$(sprite api -s "$SPRITE_NAME" "/fs/read?path=/home/sprite/.git-token" 2>/dev/null | tr -d '[:space:]')"
+    if [[ -z "$GIT_TOKEN" ]]; then
+        echo "Could not read .git-token from sprite. Was it created with grite new?" >&2
+        exit 1
+    fi
+
+    echo "==> Pushing ${REPO} to sprite"
+    _push_repo "$SPRITE_NAME" "$SPRITE_URL" "$GIT_TOKEN"
+
+    registry_add "$SPRITE_NAME" "$(pwd)"
+    _append_repo_claude_md "$SPRITE_NAME" "$REPO"
+
+    retry_exec sprite exec -s "$SPRITE_NAME" --http-post -- \
+        sprite-env checkpoints create --comment "Joined repo: ${REPO}"
+
+    echo ""
+    echo "Done! Repo '${REPO}' joined sprite 'grite-${1}'."
+    echo ""
+    echo "  Fetch:  git fetch $SPRITE_NAME"
+    echo "  Push:   git push $SPRITE_NAME $SPRITE_NAME"
+    echo "  Pull:   git pull $SPRITE_NAME $SPRITE_NAME"
+    echo ""
+    echo "Connect with: grite c ${1}"
+    echo ""
+}
+
+# ─── grite new ─────────────────────────────────────────────────────────────────
+
+cmd_new() {
+    local TASK="${1:-$(date +%s | tail -c 5)}"
+    local SPRITE_NAME="grite-${TASK}"
+    local GIT_TOKEN
+    GIT_TOKEN="$(openssl rand -hex 16)"
+
+    echo "==> Creating sprite: $SPRITE_NAME"
+    sprite create "$SPRITE_NAME" --skip-console 2>&1 || {
+        if sprite api "/v1/sprites/${SPRITE_NAME}" 2>/dev/null | jq -e '.name' &>/dev/null; then
+            echo "  Sprite already exists, continuing"
+        else
+            echo "  Failed to create sprite" >&2
+            exit 1
+        fi
+    }
+
+    echo "==> Setting URL auth to public"
+    retry sprite url update --auth public -s "$SPRITE_NAME"
+
+    local SPRITE_URL
+    SPRITE_URL="$(retry sprite url -s "$SPRITE_NAME" | grep '^URL:' | sed 's/^URL:[[:space:]]*//' | tr -d '[:space:]')"
+    echo "  Sprite URL: $SPRITE_URL"
+
+    # --- Git HTTP server (Go) ---
+    read -r -d '' GIT_SERVER_GO << 'GOEOF' || true
+package main
+
+import (
+	"compress/gzip"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"net/http/httputil"
+	"net/url"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+)
+
+const repoRoot = "/home/sprite"
+
+var (
+	appProxy *httputil.ReverseProxy
+	gitToken string
+)
+
+func init() {
+	tokenBytes, err := os.ReadFile("/home/sprite/.git-token")
+	if err != nil {
+		log.Fatalf("failed to read /home/sprite/.git-token: %v", err)
+	}
+	gitToken = strings.TrimSpace(string(tokenBytes))
+
+	appPort := os.Getenv("APP_PORT")
+	if appPort == "" {
+		appPort = "3000"
+	}
+	target, _ := url.Parse("http://127.0.0.1:" + appPort)
+	appProxy = httputil.NewSingleHostReverseProxy(target)
+	appProxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
+		http.Error(w, "No app server running on port "+appPort, http.StatusBadGateway)
+	}
+}
+
+func main() {
+	http.HandleFunc("/", handler)
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+	log.Printf("git-http-server listening on :%s", port)
+	log.Fatal(http.ListenAndServe(":"+port, nil))
+}
+
+func isGitRequest(method, path string) bool {
+	if method == "GET" && strings.HasSuffix(path, "/info/refs") {
+		return true
+	}
+	if method == "POST" && (strings.HasSuffix(path, "/git-upload-pack") || strings.HasSuffix(path, "/git-receive-pack")) {
+		return true
+	}
+	return false
+}
+
+func handler(w http.ResponseWriter, r *http.Request) {
+	log.Printf("%s %s", r.Method, r.URL.String())
+	path := r.URL.Path
+
+	if isGitRequest(r.Method, path) {
+		if gitToken != "" {
+			_, pass, ok := r.BasicAuth()
+			if !ok || pass != gitToken {
+				w.Header().Set("WWW-Authenticate", `Basic realm="git"`)
+				http.Error(w, "Unauthorized", 401)
+				return
+			}
+		}
+		if r.Method == "GET" {
+			serveInfoRefs(w, r)
+		} else {
+			service := "git-upload-pack"
+			if strings.HasSuffix(path, "/git-receive-pack") {
+				service = "git-receive-pack"
+			}
+			serveGitPack(w, r, service)
+		}
+		return
+	}
+
+	appProxy.ServeHTTP(w, r)
+}
+
+func repoPath(urlPath string) string {
+	parts := strings.SplitN(strings.TrimPrefix(urlPath, "/"), "/", 2)
+	if len(parts) > 0 {
+		return filepath.Join(repoRoot, parts[0])
+	}
+	return ""
+}
+
+func serveInfoRefs(w http.ResponseWriter, r *http.Request) {
+	service := r.URL.Query().Get("service")
+	if service != "git-upload-pack" && service != "git-receive-pack" {
+		http.Error(w, "invalid service", 400)
+		return
+	}
+	dir := repoPath(r.URL.Path)
+	cmd := exec.Command("git", service[4:], "--stateless-rpc", "--advertise-refs", dir)
+	out, err := cmd.Output()
+	if err != nil {
+		log.Printf("error running %s --advertise-refs: %v", service, err)
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	w.Header().Set("Content-Type", fmt.Sprintf("application/x-%s-advertisement", service))
+	w.Header().Set("Cache-Control", "no-cache")
+	w.WriteHeader(200)
+	header := fmt.Sprintf("# service=%s\n", service)
+	pktLine := fmt.Sprintf("%04x%s", len(header)+4, header)
+	w.Write([]byte(pktLine))
+	w.Write([]byte("0000"))
+	w.Write(out)
+}
+
+func serveGitPack(w http.ResponseWriter, r *http.Request, service string) {
+	dir := repoPath(r.URL.Path)
+	cmd := exec.Command("git", service[4:], "--stateless-rpc", dir)
+
+	var body io.Reader = r.Body
+	if r.Header.Get("Content-Encoding") == "gzip" {
+		gz, err := gzip.NewReader(r.Body)
+		if err != nil {
+			log.Printf("error decompressing gzip request: %v", err)
+			http.Error(w, err.Error(), 400)
+			return
+		}
+		defer gz.Close()
+		body = gz
+	}
+	cmd.Stdin = body
+	cmd.Stderr = os.Stderr
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		log.Printf("error creating stdout pipe: %v", err)
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	if err := cmd.Start(); err != nil {
+		log.Printf("error starting %s: %v", service, err)
+		http.Error(w, err.Error(), 500)
+		return
+	}
+
+	w.Header().Set("Content-Type", fmt.Sprintf("application/x-%s-result", service))
+	w.Header().Set("Cache-Control", "no-cache")
+	w.WriteHeader(200)
+
+	buf := make([]byte, 32*1024)
+	f, canFlush := w.(http.Flusher)
+	for {
+		n, readErr := stdout.Read(buf)
+		if n > 0 {
+			w.Write(buf[:n])
+			if canFlush {
+				f.Flush()
+			}
+		}
+		if readErr != nil {
+			break
+		}
+	}
+	if err := cmd.Wait(); err != nil {
+		log.Printf("error waiting for %s: %v", service, err)
+	}
+}
+GOEOF
+
+    echo "==> Deploying git server and token to sprite"
+
+    local TMPDIR_GRITE
+    TMPDIR_GRITE="$(mktemp -d)"
+    trap "rm -rf '$TMPDIR_GRITE'" EXIT
+
+    printf '%s' "$GIT_SERVER_GO" > "$TMPDIR_GRITE/main.go"
+    printf '%s' "$GIT_TOKEN" > "$TMPDIR_GRITE/.git-token"
+
+    echo "  Writing main.go"
+    retry sprite api -s "$SPRITE_NAME" \
+        "/fs/write?path=/home/sprite/git-server/main.go&mkdir=true" \
+        -- -X PUT --data-binary @"$TMPDIR_GRITE/main.go"
+
+    echo "  Writing .git-token"
+    retry sprite api -s "$SPRITE_NAME" \
+        "/fs/write?path=/home/sprite/.git-token&mkdir=true" \
+        -- -X PUT --data-binary @"$TMPDIR_GRITE/.git-token"
+
+    cat > "$TMPDIR_GRITE/build.sh" << 'BUILDEOF'
+set -e
+cd /home/sprite/git-server
+[ -f go.mod ] || go mod init git-server
+go build -o git-http-server .
+BUILDEOF
+
+    retry sprite api -s "$SPRITE_NAME" \
+        "/fs/write?path=/home/sprite/build.sh&mkdir=true" \
+        -- -X PUT --data-binary @"$TMPDIR_GRITE/build.sh"
+
+    retry_exec sprite exec -s "$SPRITE_NAME" --http-post -- sudo chown sprite:sprite /home/sprite
+
+    echo "  Building git server"
+    retry_exec sprite exec -s "$SPRITE_NAME" --http-post -- bash /home/sprite/build.sh
+
+    echo "  Registering service"
+    retry_exec sprite exec -s "$SPRITE_NAME" --http-post -- sprite-env services create git-server \
+        --cmd /home/sprite/git-server/git-http-server \
+        --http-port 8080
+
+    echo "==> Pushing ${REPO} to sprite"
+    _push_repo "$SPRITE_NAME" "$SPRITE_URL" "$GIT_TOKEN"
+
+    registry_add "$SPRITE_NAME" "$(pwd)"
+    _write_base_claude_md "$SPRITE_NAME"
+    _append_repo_claude_md "$SPRITE_NAME" "$REPO"
+
+    retry_exec sprite exec -s "$SPRITE_NAME" --http-post -- \
+        sprite-env checkpoints create --comment 'Initial setup: git server + repo cloned'
+
+    echo ""
+    echo "Done! Sprite is ready."
+    echo ""
+    echo "  Sprite:  $SPRITE_NAME"
+    echo "  URL:     $SPRITE_URL"
+    echo "  Branch:  $SPRITE_NAME"
+    echo ""
+    echo "  Join:    grite join $TASK  (from another repo)"
+    echo "  Open:    grite open $TASK (opens url in browser)"
+    echo "  Fetch:   git fetch $SPRITE_NAME"
+    echo "  Push:    git push $SPRITE_NAME <branch>"
+    echo "  Pull:    git pull $SPRITE_NAME <branch>"
+    echo ""
+    echo "Connect with: grite c $TASK"
+    echo ""
+}
+
+# ─── grite open ────────────────────────────────────────────────────────────────
+
+cmd_open() {
+    if [ $# -lt 1 ]; then
+        echo "Usage: grite open <task-name>" >&2
+        exit 1
+    fi
+
+    local SPRITE_NAME="grite-${1}"
+    local url
+    url="$(sprite api "/v1/sprites/${SPRITE_NAME}" 2>/dev/null | jq -r '.url // empty')"
+
+    if [[ -z "$url" ]]; then
+        echo "Sprite '$SPRITE_NAME' not found." >&2
+        exit 1
+    fi
+
+    echo "Opening $url"
+    _open_url "$url"
+}
+
+# ─── grite c ───────────────────────────────────────────────────────────────────
+
+cmd_console() {
+    if [ $# -lt 1 ]; then
+        echo "Usage: grite c <task-name>" >&2
+        exit 1
+    fi
+
+    local SPRITE_NAME="grite-${1}"
+
+    local sessions
+    sessions="$(sprite api "/v1/sprites/${SPRITE_NAME}/exec" 2>/dev/null)"
+
+    local session_id
+    session_id="$(echo "$sessions" | jq -r '[.sessions[] | select(.tty == true)] | sort_by(.created) | last | .id // empty')"
+
+    if [[ -n "$session_id" ]]; then
+        echo "Attaching to session $session_id"
+        TERM=xterm exec sprite sessions attach "$session_id" -s "$SPRITE_NAME"
+    else
+        echo "Starting new console"
+        TERM=xterm exec sprite c -s "$SPRITE_NAME"
+    fi
+}
+
+# ─── main ──────────────────────────────────────────────────────────────────────
+
+case "${1:-}" in
+    new)   shift; cmd_new "$@" ;;
+    join)  shift; cmd_join "$@" ;;
+    rm)    shift; cmd_rm "$@" ;;
+    ls)    cmd_ls ;;
+    open)  shift; cmd_open "$@" ;;
+    c)     shift; cmd_console "$@" ;;
+    *)
+        echo "Usage: grite <new|join|rm|ls|open|c> [args]" >&2
+        echo "" >&2
+        echo "  grite new  [task-name]      Create a new grite and push the current repo" >&2
+        echo "  grite join <task-name>      Add the current repo to an existing grite" >&2
+        echo "  grite rm   <task-name>      Destroy a grite and remove all its remotes" >&2
+        echo "  grite open <task-name>      Open a grite's URL in the browser" >&2
+        echo "  grite c    <task-name>      Attach to or start a console session" >&2
+        echo "  grite ls                    List all grites and their status" >&2
+        exit 1
+        ;;
+esac

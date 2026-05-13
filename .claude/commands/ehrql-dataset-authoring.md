@@ -1,0 +1,1 @@
+../../.codex/skills/ehrql-dataset-authoring/SKILL.md
