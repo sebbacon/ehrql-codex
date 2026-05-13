@@ -18,8 +18,10 @@ Use this skill when the user wants this repo's dataset definition changed to mat
 
 - Prize legibility over cleverness.
 - Use clear intermediate names for subqueries, date cutoffs, codelists, and derived concepts.
-- Add short, informative comments when they help a reviewer map the code back to the user's original specification.
-- Comments are most useful when they explain why a block exists or which requirement it satisfies.
+- Add short, informative comments in the dataset definition by default, especially where a block maps back to the user's specification, a named rule, a date window, or an exclusion.
+- Comments should make it obvious which part of the spec the code is implementing and why that block exists.
+- Assurance tests are always required for dataset-definition changes.
+- In assurance tests, every patient scenario must include comments stating exactly what logic it is verifying, for example inclusion on a qualifying path, exclusion by a specific rule, a boundary-date condition, or a no-matching-event case.
 - When you add tests, organize scenarios so they are easy to scan:
   `in population`, `excluded`, `boundary date`, `no matching event`, `multiple matching events`, and similar slices.
 
@@ -40,9 +42,11 @@ Use this skill when the user wants this repo's dataset definition changed to mat
 3. Open only the upstream docs you need from `references/upstream/`.
 4. Implement the dataset definition with explicit names and readable structure.
 5. Test the result.
-6. Unless the change is truly trivial, add or update assurance tests as well as running dummy-data generation.
+6. Add or update assurance tests in `analysis/test_dataset_definition.py`.
+7. Ensure each assurance-test case is commented so a reviewer can see the exact rule or branch being checked.
+8. Run both assurance tests and dummy-data generation.
 
-Always test. Dummy-data generation checks that the definition compiles and can produce output. Assurance tests check the exact behaviour on representative patients.
+Always test. Dummy-data generation checks that the definition compiles and can produce output. Assurance tests are mandatory and check the exact behaviour on representative patients.
 
 ## Upstream doc map
 
@@ -68,8 +72,11 @@ Always test. Dummy-data generation checks that the definition compiles and can p
 ## Testing expectations
 
 - Minimum: run dummy-data generation after every substantive edit.
-- Add assurance tests when logic includes branching, exclusions, date windows, sorted event selection, derived booleans, or any behaviour that could be disputed from reading alone.
+- Minimum: run dummy-data generation and assurance tests after every substantive edit.
+- Assurance tests are required for every dataset-definition change, not only for complex logic.
 - In assurance tests, make the patient stories obvious. A small number of well-named scenarios is better than a dense unreadable fixture.
+- Every test case should include comments that explicitly describe the rule being checked, such as why the patient is included, why they are excluded, or which boundary/window behaviour is under test.
+- When dataset logic follows a written specification, annotate the corresponding code blocks with comments that point back to the specification text rather than leaving the mapping implicit.
 
 ## References
 
