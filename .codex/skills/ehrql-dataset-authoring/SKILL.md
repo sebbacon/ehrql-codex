@@ -98,6 +98,7 @@ Whenever codelists are imported, add a clearly visible block comment near the to
 6. Add or update assurance tests in `analysis/test_dataset_definition.py`.
 7. Ensure each assurance-test case is commented so a reviewer can see the exact rule or branch being checked.
 8. Run both assurance tests and dummy-data generation.
+9. Update `README.md` to reflect the current state of the dataset definition: describe the brief (what the definition is trying to implement, in plain language) and include the exact command to generate a dataset from it.
 
 Always test. Dummy-data generation checks that the definition compiles and can produce output. Assurance tests are mandatory and check the exact behaviour on representative patients.
 
@@ -158,6 +159,19 @@ Before generating any events, reason about the domain being modelled:
 - Do not generate dates solely in the range needed to pass ehrQL's filter predicates. If reviews happen annually, generate them annually across the patient's history.
 - Do not hardcode representative proportions as inline literals — name them.
 - Do not generate only the tables or columns the current ehrQL reads; generate all standard tables (patients, registrations, clinical_events, medications) with enough realism that the data could plausibly feed a different query on the same population.
+
+### README update after generating custom dummy tables
+
+After successfully generating custom dummy tables, update `README.md` with a dedicated section that covers:
+
+1. **What the dummy data represents** — describe the patient population, prevalence rates, and scenario coverage in plain language so a reader understands what the data is modelling.
+2. **How to regenerate it** — the exact command to re-run the generator script (e.g. `uv run python scripts/generate_dummy_tables.py`).
+3. **How to use it with ehrQL** — the exact `ehrql generate-dataset` command that points at the dummy tables directory, for example:
+   ```
+   .venv/bin/ehrql generate-dataset analysis/dataset_definition.py \
+     --dummy-tables dummy-tables/ \
+     --output dataset.csv
+   ```
 
 - Generated local index: `references/source-index.md`
 - Upstream copies: `references/upstream/*.md`
